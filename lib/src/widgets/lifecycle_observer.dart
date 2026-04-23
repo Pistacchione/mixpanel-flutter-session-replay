@@ -5,13 +5,15 @@ import '../internal/widget_coordinator.dart';
 /// Observes app lifecycle state changes and flushes queued events when the app
 /// is backgrounded or minimized.
 ///
-/// This widget monitors [AppLifecycleState.hidden] which is triggered when:
-/// - Mobile (iOS/Android): App is backgrounded
-/// - Desktop (macOS/Windows/Linux): Windows are minimized or hidden
-/// - Web: Browser tab is backgrounded
+/// The observer treats [AppLifecycleState.inactive] as still foreground.
+/// Only transitions into [AppLifecycleState.hidden], [AppLifecycleState.paused]
+/// or [AppLifecycleState.detached] are reported as backgrounding, which
+/// prevents transient inactive states (e.g. presenting a native full-screen
+/// component, pulling down the notification shade, incoming call overlay)
+/// from terminating the current replay session.
 ///
-/// When the app enters the hidden state, all queued session replay events are
-/// immediately flushed to ensure data isn't lost.
+/// When the app becomes non-visible, all queued session replay events are
+/// flushed so data isn't lost.
 class LifecycleObserver extends StatefulWidget {
   const LifecycleObserver({
     super.key,
@@ -33,6 +35,17 @@ class _LifecycleObserverState extends State<LifecycleObserver>
     with WidgetsBindingObserver {
   AppLifecycleState? _lastState;
 
+  /// Latch set when a real backgrounding has been reported.
+  ///
+  /// Cleared when the matching [onAppForegrounded] is fired. This is needed
+  /// because on iOS the foreground sequence is typically
+  /// `paused → hidden → inactive → resumed`, and when the final `resumed`
+  /// arrives the immediately previous state is `inactive` (level 2, equal to
+  /// the visibility threshold), which would miss the "non-visible → resumed"
+  /// condition on its own. The latch carries the "we already backgrounded"
+  /// signal across the intermediate states.
+  bool _wasBackgrounded = false;
+
   @override
   void initState() {
     super.initState();
@@ -45,6 +58,13 @@ class _LifecycleObserverState extends State<LifecycleObserver>
         'LifecycleObserver detected initial resume state',
       );
       widget.coordinator.onAppForegrounded();
+    } else {
+      // Observer was mounted while the app was NOT in `resumed` (could be
+      // `inactive`, `hidden`, `paused`, or `null`). Prime the latch so the
+      // next `resumed` fires onAppForegrounded even when the interim state
+      // sits on the visibility threshold (e.g. `inactive → resumed`, which
+      // otherwise would not satisfy `lastLevel < visibleThreshold`).
+      _wasBackgrounded = true;
     }
     _lastState = initialState;
   }
@@ -72,23 +92,45 @@ class _LifecycleObserverState extends State<LifecycleObserver>
         ? _getVisibilityLevel(_lastState!)
         : null;
 
-    // Detect transition to inactive
-    // Only trigger if coming from a MORE visible state (resumed)
-    if (state == AppLifecycleState.inactive &&
+    // Visibility threshold: states at or above are considered "visible".
+    // `inactive` is intentionally treated as visible so that transient
+    // inactive states (native full-screen components, notification shade,
+    // incoming call UI, app switcher) don't terminate the current session.
+    const visibleThreshold = 2;
+
+    // Detect transition to a non-visible state from a visible one.
+    if (currentLevel < visibleThreshold &&
         lastLevel != null &&
-        lastLevel > currentLevel) {
+        lastLevel >= visibleThreshold) {
       widget.coordinator.logger.info(
-        'LifecycleObserver detected app becoming inactive',
+        'LifecycleObserver detected app becoming non-visible',
       );
       widget.coordinator.onAppBackgrounded();
+      _wasBackgrounded = true;
     }
 
-    // Detect transition to resumed
-    // Trigger if: no previous state OR coming from a LESS visible state
+    // Detect transition to resumed. Fire onAppForegrounded if either:
+    //   - this is the first resume (lastLevel == null), or
+    //   - the previous state was below the visibility threshold (direct
+    //     non-visible → resumed), or
+    //   - a real backgrounding has already been reported earlier in the
+    //     chain (iOS returns via paused → hidden → inactive → resumed;
+    //     without the latch the condition above would miss this final leg
+    //     because `inactive` sits on the threshold).
+    //
+    // The latch is cleared on every actual fire so that a later
+    // `inactive → resumed` bounce (notification shade, app-switcher peek)
+    // does not re-trigger onAppForegrounded and create a duplicate session.
     if (state == AppLifecycleState.resumed &&
-        (lastLevel == null || lastLevel < currentLevel)) {
-      widget.coordinator.logger.info('LifecycleObserver detected app resuming');
+        (lastLevel == null ||
+            lastLevel < visibleThreshold ||
+            _wasBackgrounded)) {
+      widget.coordinator.logger.info(
+        'LifecycleObserver detected app resuming'
+        '${_wasBackgrounded ? ' (after prior backgrounding)' : ''}',
+      );
       widget.coordinator.onAppForegrounded();
+      _wasBackgrounded = false;
     }
 
     _lastState = state;
